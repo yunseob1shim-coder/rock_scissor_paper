@@ -1,0 +1,16 @@
+# Rock-Scissors-Paper Detection Dataset Configuration
+# YOLO format dataset for fine-tuning yolo26n.pt
+
+path: ./data          # dataset root (relative to train.py)
+train: train/images   # train images folder
+val: valid/images     # validation images folder
+test: test/images     # test images folder (optional)
+
+# Number of classes
+nc: 3
+
+# Class names  (index 0=rock, 1=scissors, 2=paper)
+names:
+  0: rock
+  1: scissors
+  2: paper
