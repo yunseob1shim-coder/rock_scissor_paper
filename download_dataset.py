@@ -73,9 +73,11 @@ def get_export_link(api_key: str, workspace: str, project: str, version: int) ->
     sys.exit(1)
 
 
-def download_zip(url: str, dest: Path):
-    """URL에서 zip 파일을 다운로드합니다."""
-    resp = requests.get(url, stream=True, timeout=180)
+def download_zip(url: str, dest: Path) -> bool:
+    """URL에서 zip 파일을 다운로드합니다. 성공 시 True, 404이면 False 반환."""
+    resp = requests.get(url, stream=True, timeout=180, allow_redirects=True)
+    if resp.status_code == 404:
+        return False
     resp.raise_for_status()
 
     total = int(resp.headers.get("content-length", 0))
@@ -88,6 +90,7 @@ def download_zip(url: str, dest: Path):
                 print(f"\r  {downloaded / total * 100:5.1f}%  ({downloaded // 1024} / {total // 1024} KB)",
                       end="", flush=True)
     print()
+    return True
 
 
 def extract_to_data(zip_path: Path):
@@ -142,15 +145,28 @@ if __name__ == "__main__":
     print("\n=== Roboflow 다운로드 ===")
     print(f"  {args.workspace}/{args.project} v{args.version}")
 
-    # 1. export 링크 획득 (준비될 때까지 폴링)
-    link = get_export_link(args.api_key, args.workspace, args.project, args.version)
-    print(f"  링크 획득: {link[:70]}...")
-
-    # 2. zip 다운로드 및 압축 해제
+    # 1. export 링크 획득 + 다운로드 (GCS 업로드 지연 대비 재시도)
+    RETRY_DELAYS = [3, 5, 10, 15, 20, 30]
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = Path(tmp) / "dataset.zip"
-        print("  다운로드 중...")
-        download_zip(link, zip_path)
+        downloaded = False
+        for attempt, wait in enumerate(RETRY_DELAYS + [None]):
+            # 매 시도마다 API에서 fresh signed URL 요청 (캐시된 만료 URL 방지)
+            link = get_export_link(args.api_key, args.workspace, args.project, args.version)
+            print(f"  [시도 {attempt+1}] {link[:70]}...")
+
+            print("  다운로드 중...")
+            ok = download_zip(link, zip_path)
+            if ok:
+                downloaded = True
+                break
+
+            if wait is None:
+                print("[ERROR] 최대 재시도 횟수 초과.")
+                sys.exit(1)
+            print(f"  [404] GCS 업로드 대기 중... {wait}초 후 재시도")
+            time.sleep(wait)
+
         print(f"  크기: {zip_path.stat().st_size // 1024} KB")
 
         if not zipfile.is_zipfile(zip_path):
@@ -159,7 +175,6 @@ if __name__ == "__main__":
 
         print("  압축 해제 및 복사 중...")
         extract_to_data(zip_path)
-
     print("\n=== 다운로드 후 현황 ===")
     check_dataset()
 
