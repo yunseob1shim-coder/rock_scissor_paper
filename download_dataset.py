@@ -1,15 +1,11 @@
 """
 download_dataset.py
 -------------------
-Roboflow에서 Rock-Scissors-Paper 데이터셋을 자동으로 다운로드하고
+Roboflow REST API를 직접 호출하여 Rock-Scissors-Paper 데이터셋을 다운로드하고
 YOLO 포맷으로 data/ 폴더에 배치합니다.
 
 사용법:
-    pip install roboflow
     python download_dataset.py --api-key YOUR_ROBOFLOW_API_KEY
-
-Roboflow API 키 없이 수동으로 데이터를 준비하려면
-아래 "수동 데이터 준비 가이드"를 참고하세요.
 
 수동 데이터 준비 가이드:
     1. https://public.roboflow.com/object-detection/rock-paper-scissors-sxsw 에서
@@ -24,54 +20,106 @@ Roboflow API 키 없이 수동으로 데이터를 준비하려면
     3. 레이블 파일 포맷 (각 줄): <class_id> <cx> <cy> <w> <h>
          0 = rock, 1 = scissors, 2 = paper
          모든 값은 0~1 사이로 정규화된 값
-
-웹캠으로 직접 데이터를 수집하려면 collect_data.py를 실행하세요.
 """
 
 import argparse
-import os
 import sys
 import shutil
+import zipfile
+import tempfile
 from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("[ERROR] requests 패키지가 없습니다. pip install requests 실행 후 재시도하세요.")
+    sys.exit(1)
 
 
 def download_from_roboflow(api_key: str, workspace: str, project: str, version: int):
-    """Roboflow에서 데이터셋을 다운로드하고 data/ 폴더에 배치합니다."""
-    try:
-        from roboflow import Roboflow
-    except ImportError:
-        print("[ERROR] roboflow 패키지가 없습니다. pip install roboflow 실행 후 재시도하세요.")
+    """Roboflow REST API를 직접 호출하여 데이터셋을 다운로드합니다."""
+
+    # Step 1: 다운로드 URL 획득
+    api_url = f"https://api.roboflow.com/{workspace}/{project}/{version}/yolov8"
+    print(f"  API 요청: {api_url}")
+    resp = requests.get(api_url, params={"api_key": api_key}, timeout=30)
+    if resp.status_code != 200:
+        print(f"[ERROR] API 요청 실패 (HTTP {resp.status_code}): {resp.text[:200]}")
         sys.exit(1)
 
-    rf = Roboflow(api_key=api_key)
-    project_obj = rf.workspace(workspace).project(project)
-    dataset = project_obj.version(version).download("yolov8")
+    data = resp.json()
+    if "export" not in data or "link" not in data["export"]:
+        print(f"[ERROR] 응답에 download link 없음: {data}")
+        sys.exit(1)
 
-    dataset_dir = Path(dataset.location)
-    dest_root = Path("data")
+    download_url = data["export"]["link"]
+    print(f"  다운로드 URL: {download_url[:80]}...")
 
-    # train / valid / test 폴더 이동
-    for split in ["train", "valid", "test"]:
-        src_images = dataset_dir / split / "images"
-        src_labels = dataset_dir / split / "labels"
-        dst_images = dest_root / split / "images"
-        dst_labels = dest_root / split / "labels"
+    # Step 2: zip 다운로드
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        zip_path = Path(tmp_dir) / "dataset.zip"
+        print("  zip 다운로드 중...")
+        with requests.get(download_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            downloaded = 0
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded / total * 100
+                        print(f"\r  {pct:5.1f}% ({downloaded//1024}KB / {total//1024}KB)", end="", flush=True)
+        print(f"\n  다운로드 완료: {zip_path.stat().st_size // 1024} KB")
 
-        if src_images.exists():
-            dst_images.mkdir(parents=True, exist_ok=True)
-            for f in src_images.iterdir():
-                shutil.copy2(f, dst_images / f.name)
-            print(f"  [OK] {split}/images: {len(list(src_images.iterdir()))}장 복사")
+        # Step 3: zip 검증 및 압축 해제
+        if not zipfile.is_zipfile(zip_path):
+            print("[ERROR] 다운로드된 파일이 유효한 zip 파일이 아닙니다.")
+            print("        API 키 권한 또는 프로젝트/버전 번호를 확인하세요.")
+            sys.exit(1)
 
-        if src_labels.exists():
-            dst_labels.mkdir(parents=True, exist_ok=True)
-            for f in src_labels.iterdir():
-                shutil.copy2(f, dst_labels / f.name)
-            print(f"  [OK] {split}/labels: {len(list(src_labels.iterdir()))}개 복사")
+        extract_dir = Path(tmp_dir) / "extracted"
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+        print(f"  압축 해제 완료: {extract_dir}")
 
-    # 임시 다운로드 폴더 삭제
-    shutil.rmtree(dataset_dir, ignore_errors=True)
+        # Step 4: data/ 폴더에 복사
+        dest_root = Path("data")
+        for split in ["train", "valid", "test"]:
+            # 압축 해제 후 구조가 다를 수 있으므로 재귀 탐색
+            src_images = _find_dir(extract_dir, split, "images")
+            src_labels = _find_dir(extract_dir, split, "labels")
+
+            if src_images and src_images.exists():
+                dst = dest_root / split / "images"
+                dst.mkdir(parents=True, exist_ok=True)
+                files = [f for f in src_images.iterdir() if f.is_file()]
+                for f in files:
+                    shutil.copy2(f, dst / f.name)
+                print(f"  [OK] {split}/images: {len(files)}장 복사")
+
+            if src_labels and src_labels.exists():
+                dst = dest_root / split / "labels"
+                dst.mkdir(parents=True, exist_ok=True)
+                files = [f for f in src_labels.iterdir() if f.is_file()]
+                for f in files:
+                    shutil.copy2(f, dst / f.name)
+                print(f"  [OK] {split}/labels: {len(files)}개 복사")
+
     print("\n[완료] 데이터셋 준비 완료!")
+
+
+def _find_dir(root: Path, split: str, subdir: str) -> Path:
+    """압축 해제 디렉토리에서 split/subdir 경로를 재귀적으로 탐색합니다."""
+    # 직접 경로 시도
+    direct = root / split / subdir
+    if direct.exists():
+        return direct
+    # 하위 폴더에 있는 경우
+    for p in root.rglob(f"{split}/{subdir}"):
+        if p.is_dir():
+            return p
+    return None
 
 
 def check_dataset():
