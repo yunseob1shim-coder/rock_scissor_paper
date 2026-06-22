@@ -28,6 +28,209 @@ except ImportError:
     sys.exit(1)
 
 
+# ── 시도할 데이터셋 후보 (앞에서부터 순서대로 시도) ──────────────
+CANDIDATES = [
+    # (workspace, project, version, format)
+    ("joseph-nelson", "rock-paper-scissors-sxsw", 14, "yolov8"),
+    ("joseph-nelson", "rock-paper-scissors-sxsw", 14, "yolov5pytorch"),
+    ("joseph-nelson", "rock-paper-scissors-sxsw", 13, "yolov8"),
+    ("joseph-nelson", "rock-paper-scissors-sxsw", 12, "yolov8"),
+    ("joseph-nelson", "rock-paper-scissors-sxsw", 1,  "yolov8"),
+    ("public-cv",     "rock-paper-scissors-sxsw", 1,  "yolov8"),
+]
+
+
+def get_export_link(api_key: str, workspace: str, project: str,
+                    version: int, fmt: str) -> str | None:
+    """
+    export 링크 획득. HTTP 202 → 생성 중(폴링), HTTP 200 → 링크 반환.
+    링크를 얻지 못하면 None 반환.
+    """
+    url = (f"https://api.roboflow.com/{workspace}/{project}"
+           f"/{version}/{fmt}?api_key={api_key}&nocache=true")
+
+    for attempt in range(30):
+        try:
+            resp = requests.get(url, timeout=20)
+        except requests.RequestException as e:
+            print(f"\n  [연결 오류] {e}")
+            return None
+
+        if resp.status_code == 404:
+            return None  # 존재하지 않는 프로젝트/버전
+        if resp.status_code not in (200, 202):
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+
+        # HTTP 202 = export 생성 중
+        if resp.status_code == 202:
+            progress = data.get("progress", 0)
+            print(f"\r  export 생성 중 {progress*100:.0f}% ({attempt*2}s)...",
+                  end="", flush=True)
+            time.sleep(2)
+            continue
+
+        # HTTP 200 = 완료
+        link = data.get("export", {}).get("link")
+        if link:
+            if attempt > 0:
+                print()
+            return link
+        return None
+
+    return None
+
+
+def try_download(url: str, dest: Path) -> bool:
+    """
+    URL에서 zip을 다운로드. 성공(유효한 zip)이면 True, 실패면 False.
+    """
+    try:
+        resp = requests.get(url, stream=True, timeout=180, allow_redirects=True)
+    except requests.RequestException:
+        return False
+
+    if resp.status_code != 200:
+        return False
+
+    # Content-Type 확인 (HTML이면 zip 아님)
+    ct = resp.headers.get("content-type", "")
+    if "html" in ct:
+        return False
+
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+
+    return zipfile.is_zipfile(dest)
+
+
+def extract_to_data(zip_path: Path):
+    """zip을 압축 해제하여 data/ 폴더에 복사합니다."""
+    extract_dir = zip_path.parent / "extracted"
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    dest_root = Path("data")
+    for split in ["train", "valid", "test"]:
+        for kind in ["images", "labels"]:
+            src = next((p for p in extract_dir.rglob(f"{split}/{kind}")
+                        if p.is_dir()), None)
+            if not src:
+                continue
+            dst = dest_root / split / kind
+            dst.mkdir(parents=True, exist_ok=True)
+            files = [f for f in src.iterdir() if f.is_file()]
+            for f in files:
+                shutil.copy2(f, dst / f.name)
+            if files:
+                print(f"  [OK] {split}/{kind}: {len(files)}개")
+
+
+def check_dataset():
+    root = Path("data")
+    for split in ["train", "valid", "test"]:
+        imgs = list((root / split / "images").glob("*.*")) \
+               if (root / split / "images").exists() else []
+        lbls = list((root / split / "labels").glob("*.txt")) \
+               if (root / split / "labels").exists() else []
+        print(f"  {split:6s} : images={len(imgs):5d}  labels={len(lbls):5d}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--api-key",   type=str, default="")
+    parser.add_argument("--workspace", type=str, default="")
+    parser.add_argument("--project",   type=str, default="")
+    parser.add_argument("--version",   type=int, default=0)
+    parser.add_argument("--check",     action="store_true")
+    args = parser.parse_args()
+
+    print("=== 데이터셋 현황 ===")
+    check_dataset()
+
+    if args.check:
+        sys.exit(0)
+
+    if not args.api_key:
+        print("\n[INFO] --api-key 옵션을 추가하여 재실행하세요.")
+        sys.exit(0)
+
+    # 사용자가 명시적으로 지정했으면 해당 항목만, 아니면 후보 목록 순서대로 시도
+    if args.workspace and args.project and args.version:
+        candidates = [(args.workspace, args.project, args.version, "yolov8")]
+    else:
+        candidates = CANDIDATES
+
+    print("\n=== Roboflow 다운로드 ===")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / "dataset.zip"
+        success = False
+
+        for ws, proj, ver, fmt in candidates:
+            print(f"\n  시도: {ws}/{proj} v{ver} [{fmt}]")
+
+            link = get_export_link(args.api_key, ws, proj, ver, fmt)
+            if not link:
+                print("  → export 링크 획득 실패, 다음 후보로")
+                continue
+
+            print(f"  링크: {link[:70]}...")
+
+            # GCS 파일이 아직 없을 수 있으니 최대 3번 재시도
+            for attempt in range(3):
+                if attempt > 0:
+                    wait = attempt * 10
+                    print(f"  → GCS 대기 {wait}초 후 재시도...")
+                    time.sleep(wait)
+                    link = get_export_link(args.api_key, ws, proj, ver, fmt) or link
+
+                print(f"  다운로드 중... (시도 {attempt+1}/3)")
+                ok = try_download(link, zip_path)
+                if ok:
+                    print(f"  다운로드 성공: {zip_path.stat().st_size // 1024} KB")
+                    success = True
+                    break
+
+            if success:
+                break
+            print("  → 다운로드 실패, 다음 후보로")
+
+        if not success:
+            print("\n[ERROR] 모든 후보 다운로드 실패.")
+            print("  수동 다운로드: https://universe.roboflow.com/joseph-nelson/rock-paper-scissors-sxsw")
+            print("  위 사이트에서 'YOLOv8' 포맷으로 다운로드 후 아래 경로에 배치:")
+            print("    data/train/images/  data/train/labels/")
+            print("    data/valid/images/  data/valid/labels/")
+            sys.exit(1)
+
+        print("  압축 해제 중...")
+        extract_to_data(zip_path)
+
+    print("\n=== 다운로드 후 현황 ===")
+    check_dataset()
+
+
+import argparse
+import sys
+import shutil
+import zipfile
+import tempfile
+import time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("[ERROR] pip install requests")
+    sys.exit(1)
+
+
 # ── Roboflow API 설정 ─────────────────────────────────────────────
 DEFAULT_WORKSPACE = "joseph-nelson"
 DEFAULT_PROJECT   = "rock-paper-scissors-sxsw"
