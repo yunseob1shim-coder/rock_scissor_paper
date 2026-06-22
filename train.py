@@ -40,7 +40,7 @@ def parse_args():
                         help="총 학습 에폭 수 (기본 50)")
     parser.add_argument("--batch",   type=int,   default=16,
                         help="배치 크기; GPU 메모리에 맞게 조정")
-    parser.add_argument("--imgsz",   type=int,   default=640,
+    parser.add_argument("--imgsz",   type=int,   default=320,
                         help="입력 이미지 크기 (픽셀)")
     parser.add_argument("--lr0",     type=float, default=0.01,
                         help="초기 학습률")
@@ -75,7 +75,7 @@ def parse_args():
                         help="MixUp 증강 확률")
 
     # ── 실행 환경 ────────────────────────────────────────────────
-    parser.add_argument("--device",  type=str,   default="",
+    parser.add_argument("--device",  type=str,   default="0",
                         help="학습 장치: '0', '0,1', 'cpu' (비우면 자동 선택)")
     parser.add_argument("--workers", type=int,   default=4,
                         help="DataLoader 워커 수 (Windows는 0 권장)")
