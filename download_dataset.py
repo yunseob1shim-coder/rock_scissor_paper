@@ -1,136 +1,54 @@
 """
 download_dataset.py
 -------------------
-Roboflow REST API로 Rock-Scissors-Paper 데이터셋을 다운로드합니다.
+로컬 zip 파일에서 Rock-Scissors-Paper 데이터셋을 추출하여
+data/ 폴더에 배치합니다.
 
 사용법:
-    python download_dataset.py --api-key YOUR_ROBOFLOW_API_KEY
+    python download_dataset.py --local-zip rsp-brick-breaker/rock-paper-scissors.merged.yolo26.zip
 
-수동 준비:
-    data/train/images/, data/train/labels/
-    data/valid/images/, data/valid/labels/
-    에 YOLO 포맷 이미지와 레이블을 직접 넣어도 됩니다.
-    레이블 포맷: <class_id> <cx> <cy> <w> <h>  (0=rock, 1=scissors, 2=paper)
+    # 데이터셋 현황만 확인
+    python download_dataset.py --check
+
+zip 내부 구조 (자동 인식):
+    train/images/, train/labels/
+    valid/images/, valid/labels/
+    test/images/,  test/labels/
 """
 
 import argparse
 import sys
-import shutil
 import zipfile
-import tempfile
-import time
 from pathlib import Path
-
-from typing import Optional, List, Tuple
-
-try:
-    import requests
-except ImportError:
-    print("[ERROR] pip install requests")
-    sys.exit(1)
-
-
-# ── 시도할 데이터셋 후보 (앞에서부터 순서대로 시도) ──────────────
-CANDIDATES = [
-    # (workspace, project, version, format)
-    ("joseph-nelson", "rock-paper-scissors-sxsw", 14, "yolov8"),
-    ("joseph-nelson", "rock-paper-scissors-sxsw", 14, "yolov5pytorch"),
-    ("joseph-nelson", "rock-paper-scissors-sxsw", 13, "yolov8"),
-    ("joseph-nelson", "rock-paper-scissors-sxsw", 12, "yolov8"),
-    ("joseph-nelson", "rock-paper-scissors-sxsw", 1,  "yolov8"),
-    ("public-cv",     "rock-paper-scissors-sxsw", 1,  "yolov8"),
-]
-
-
-def get_export_link(api_key: str, workspace: str, project: str,
-                    version: int, fmt: str) -> Optional[str]:
-    """
-    export 링크 획득. HTTP 202 → 생성 중(폴링), HTTP 200 → 링크 반환.
-    링크를 얻지 못하면 None 반환.
-    """
-    url = (f"https://api.roboflow.com/{workspace}/{project}"
-           f"/{version}/{fmt}?api_key={api_key}&nocache=true")
-
-    for attempt in range(30):
-        try:
-            resp = requests.get(url, timeout=20)
-        except requests.RequestException as e:
-            print(f"\n  [연결 오류] {e}")
-            return None
-
-        if resp.status_code == 404:
-            return None  # 존재하지 않는 프로젝트/버전
-        if resp.status_code not in (200, 202):
-            return None
-
-        try:
-            data = resp.json()
-        except Exception:
-            return None
-
-        # HTTP 202 = export 생성 중
-        if resp.status_code == 202:
-            progress = data.get("progress", 0)
-            print(f"\r  export 생성 중 {progress*100:.0f}% ({attempt*2}s)...",
-                  end="", flush=True)
-            time.sleep(2)
-            continue
-
-        # HTTP 200 = 완료
-        link = data.get("export", {}).get("link")
-        if link:
-            if attempt > 0:
-                print()
-            return link
-        return None
-
-    return None
-
-
-def try_download(url: str, dest: Path) -> bool:
-    """
-    URL에서 zip을 다운로드. 성공(유효한 zip)이면 True, 실패면 False.
-    """
-    try:
-        resp = requests.get(url, stream=True, timeout=180, allow_redirects=True)
-    except requests.RequestException:
-        return False
-
-    if resp.status_code != 200:
-        return False
-
-    # Content-Type 확인 (HTML이면 zip 아님)
-    ct = resp.headers.get("content-type", "")
-    if "html" in ct:
-        return False
-
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=65536):
-            f.write(chunk)
-
-    return zipfile.is_zipfile(dest)
 
 
 def extract_to_data(zip_path: Path):
-    """zip을 압축 해제하여 data/ 폴더에 복사합니다."""
-    extract_dir = zip_path.parent / "extracted"
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(extract_dir)
+    """zip을 메모리 효율적으로 읽어 data/ 폴더에 복사합니다."""
+    if not zipfile.is_zipfile(zip_path):
+        print(f"[ERROR] 유효한 zip 파일이 아닙니다: {zip_path}")
+        sys.exit(1)
 
     dest_root = Path("data")
-    for split in ["train", "valid", "test"]:
-        for kind in ["images", "labels"]:
-            src = next((p for p in extract_dir.rglob(f"{split}/{kind}")
-                        if p.is_dir()), None)
-            if not src:
-                continue
-            dst = dest_root / split / kind
-            dst.mkdir(parents=True, exist_ok=True)
-            files = [f for f in src.iterdir() if f.is_file()]
-            for f in files:
-                shutil.copy2(f, dst / f.name)
-            if files:
+    total = 0
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        entries = zf.namelist()
+        for split in ["train", "valid", "test"]:
+            for kind in ["images", "labels"]:
+                prefix = f"{split}/{kind}/"
+                files = [e for e in entries
+                         if e.startswith(prefix) and not e.endswith("/")]
+                if not files:
+                    continue
+                dst = dest_root / split / kind
+                dst.mkdir(parents=True, exist_ok=True)
+                for entry in files:
+                    fname = Path(entry).name
+                    (dst / fname).write_bytes(zf.read(entry))
+                total += len(files)
                 print(f"  [OK] {split}/{kind}: {len(files)}개")
+
+    print(f"\n  총 {total}개 파일 복사 완료.")
 
 
 def check_dataset():
@@ -144,13 +62,37 @@ def check_dataset():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--api-key",   type=str, default="")
-    parser.add_argument("--workspace", type=str, default="")
-    parser.add_argument("--project",   type=str, default="")
-    parser.add_argument("--version",   type=int, default=0)
-    parser.add_argument("--check",     action="store_true")
+    parser = argparse.ArgumentParser(description="Rock-Scissors-Paper 데이터셋 준비")
+    parser.add_argument("--local-zip", type=str, default="",
+                        help="로컬 zip 파일 경로")
+    parser.add_argument("--check", action="store_true",
+                        help="데이터셋 현황만 확인")
     args = parser.parse_args()
+
+    print("=== 데이터셋 현황 ===")
+    check_dataset()
+
+    if args.check:
+        sys.exit(0)
+
+    if not args.local_zip:
+        print("\n사용법:")
+        print("  python download_dataset.py \\")
+        print("    --local-zip rsp-brick-breaker/rock-paper-scissors.merged.yolo26.zip")
+        sys.exit(0)
+
+    zip_path = Path(args.local_zip)
+    if not zip_path.exists():
+        print(f"[ERROR] zip 파일 없음: {zip_path.resolve()}")
+        sys.exit(1)
+
+    print(f"\n=== zip 추출: {zip_path.name} ({zip_path.stat().st_size // 1024} KB) ===")
+    extract_to_data(zip_path)
+
+    print("\n=== 추출 후 현황 ===")
+    check_dataset()
+    print("\n학습 실행:")
+    print("  python train.py --epochs 50 --batch 16")
 
     print("=== 데이터셋 현황 ===")
     check_dataset()
