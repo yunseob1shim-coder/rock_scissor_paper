@@ -1,26 +1,168 @@
 """
 download_dataset.py
 -------------------
-Roboflow REST API를 직접 호출하여 Rock-Scissors-Paper 데이터셋을 다운로드하고
-YOLO 포맷으로 data/ 폴더에 배치합니다.
+Roboflow REST API로 Rock-Scissors-Paper 데이터셋을 다운로드합니다.
 
 사용법:
     python download_dataset.py --api-key YOUR_ROBOFLOW_API_KEY
 
-수동 데이터 준비 가이드:
-    1. https://public.roboflow.com/object-detection/rock-paper-scissors-sxsw 에서
-       "YOLO v8" 포맷으로 다운로드
-    2. 압축 해제 후 아래 구조로 복사:
-         data/train/images/  <- 학습 이미지 (.jpg/.png)
-         data/train/labels/  <- 학습 레이블 (.txt, YOLO 포맷)
-         data/valid/images/  <- 검증 이미지
-         data/valid/labels/  <- 검증 레이블
-         data/test/images/   <- 테스트 이미지 (선택)
-         data/test/labels/   <- 테스트 레이블 (선택)
-    3. 레이블 파일 포맷 (각 줄): <class_id> <cx> <cy> <w> <h>
-         0 = rock, 1 = scissors, 2 = paper
-         모든 값은 0~1 사이로 정규화된 값
+수동 준비:
+    data/train/images/, data/train/labels/
+    data/valid/images/, data/valid/labels/
+    에 YOLO 포맷 이미지와 레이블을 직접 넣어도 됩니다.
+    레이블 포맷: <class_id> <cx> <cy> <w> <h>  (0=rock, 1=scissors, 2=paper)
 """
+
+import argparse
+import sys
+import shutil
+import zipfile
+import tempfile
+import time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("[ERROR] pip install requests")
+    sys.exit(1)
+
+
+# ── Roboflow API 설정 ─────────────────────────────────────────────
+DEFAULT_WORKSPACE = "joseph-nelson"
+DEFAULT_PROJECT   = "rock-paper-scissors-sxsw"
+DEFAULT_VERSION   = 14
+
+
+def get_export_link(api_key: str, workspace: str, project: str, version: int) -> str:
+    """
+    Roboflow API를 폴링하여 export 다운로드 링크를 반환합니다.
+
+    API 동작:
+      - export가 생성 중이면: {"ready": false, "progress": 0.5}
+      - export 준비 완료이면: {"export": {"link": "https://...", "expires": 900}}
+    """
+    url = f"https://api.roboflow.com/{workspace}/{project}/{version}/yolov8"
+
+    for attempt in range(60):  # 최대 2분 대기
+        resp = requests.get(url, params={"api_key": api_key}, timeout=30)
+        if resp.status_code != 200:
+            print(f"\n[ERROR] API 오류 (HTTP {resp.status_code}): {resp.text[:300]}")
+            sys.exit(1)
+
+        data = resp.json()
+
+        # export 준비 완료
+        if "export" in data and "link" in data["export"]:
+            if attempt > 0:
+                print()  # 줄바꿈
+            return data["export"]["link"]
+
+        # export 생성 중
+        if data.get("ready") is False:
+            progress = data.get("progress", 0)
+            print(f"\r  export 생성 중... {progress * 100:.0f}%  ({attempt * 2}s)", end="", flush=True)
+            time.sleep(2)
+            continue
+
+        # 그 외 응답 (예: 빈 응답) → 잠시 후 재시도
+        print(f"\r  응답 대기 중... ({attempt * 2}s)  ", end="", flush=True)
+        time.sleep(2)
+
+    print("\n[ERROR] export 준비 시간 초과. 잠시 후 다시 시도하세요.")
+    sys.exit(1)
+
+
+def download_zip(url: str, dest: Path):
+    """URL에서 zip 파일을 다운로드합니다."""
+    resp = requests.get(url, stream=True, timeout=180)
+    resp.raise_for_status()
+
+    total = int(resp.headers.get("content-length", 0))
+    downloaded = 0
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if total:
+                print(f"\r  {downloaded / total * 100:5.1f}%  ({downloaded // 1024} / {total // 1024} KB)",
+                      end="", flush=True)
+    print()
+
+
+def extract_to_data(zip_path: Path):
+    """zip을 압축 해제하여 data/ 폴더에 복사합니다."""
+    extract_dir = zip_path.parent / "extracted"
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    dest_root = Path("data")
+    for split in ["train", "valid", "test"]:
+        for kind in ["images", "labels"]:
+            # 압축 해제 구조가 다를 수 있으므로 재귀 탐색
+            src = next((p for p in extract_dir.rglob(f"{split}/{kind}") if p.is_dir()), None)
+            if not src:
+                continue
+            dst = dest_root / split / kind
+            dst.mkdir(parents=True, exist_ok=True)
+            files = [f for f in src.iterdir() if f.is_file()]
+            for f in files:
+                shutil.copy2(f, dst / f.name)
+            if files:
+                print(f"  [OK] {split}/{kind}: {len(files)}개")
+
+
+def check_dataset():
+    root = Path("data")
+    for split in ["train", "valid", "test"]:
+        imgs = list((root / split / "images").glob("*.*")) if (root / split / "images").exists() else []
+        lbls = list((root / split / "labels").glob("*.txt")) if (root / split / "labels").exists() else []
+        print(f"  {split:6s} : images={len(imgs):5d}  labels={len(lbls):5d}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Rock-Scissors-Paper 데이터셋 다운로드")
+    parser.add_argument("--api-key",   type=str, default="")
+    parser.add_argument("--workspace", type=str, default=DEFAULT_WORKSPACE)
+    parser.add_argument("--project",   type=str, default=DEFAULT_PROJECT)
+    parser.add_argument("--version",   type=int, default=DEFAULT_VERSION)
+    parser.add_argument("--check",     action="store_true", help="현재 데이터셋 상태만 확인")
+    args = parser.parse_args()
+
+    print("=== 데이터셋 현황 ===")
+    check_dataset()
+
+    if args.check:
+        sys.exit(0)
+
+    if not args.api_key:
+        print("\n[INFO] --api-key 옵션을 추가하여 재실행하세요.")
+        sys.exit(0)
+
+    print("\n=== Roboflow 다운로드 ===")
+    print(f"  {args.workspace}/{args.project} v{args.version}")
+
+    # 1. export 링크 획득 (준비될 때까지 폴링)
+    link = get_export_link(args.api_key, args.workspace, args.project, args.version)
+    print(f"  링크 획득: {link[:70]}...")
+
+    # 2. zip 다운로드 및 압축 해제
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / "dataset.zip"
+        print("  다운로드 중...")
+        download_zip(link, zip_path)
+        print(f"  크기: {zip_path.stat().st_size // 1024} KB")
+
+        if not zipfile.is_zipfile(zip_path):
+            print("[ERROR] 유효한 zip 파일이 아닙니다. API 키와 버전 번호를 확인하세요.")
+            sys.exit(1)
+
+        print("  압축 해제 및 복사 중...")
+        extract_to_data(zip_path)
+
+    print("\n=== 다운로드 후 현황 ===")
+    check_dataset()
+
 
 import argparse
 import sys
