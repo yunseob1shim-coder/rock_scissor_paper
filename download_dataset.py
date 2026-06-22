@@ -21,6 +21,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from typing import Optional, List, Tuple
+
 try:
     import requests
 except ImportError:
@@ -41,7 +43,7 @@ CANDIDATES = [
 
 
 def get_export_link(api_key: str, workspace: str, project: str,
-                    version: int, fmt: str) -> str | None:
+                    version: int, fmt: str) -> Optional[str]:
     """
     export 링크 획득. HTTP 202 → 생성 중(폴링), HTTP 200 → 링크 반환.
     링크를 얻지 못하면 None 반환.
