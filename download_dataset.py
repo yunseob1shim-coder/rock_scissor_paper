@@ -27,6 +27,7 @@ import sys
 import shutil
 import zipfile
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -36,43 +37,75 @@ except ImportError:
     sys.exit(1)
 
 
-def download_from_roboflow(api_key: str, workspace: str, project: str, version: int):
-    """Roboflow REST API를 직접 호출하여 데이터셋을 다운로드합니다."""
-
-    # Step 1: 다운로드 URL 획득
+def _get_fresh_download_url(api_key: str, workspace: str, project: str, version: int) -> str:
+    """Roboflow API에서 새 signed download URL을 요청합니다."""
     api_url = f"https://api.roboflow.com/{workspace}/{project}/{version}/yolov8"
-    print(f"  API 요청: {api_url}")
     resp = requests.get(api_url, params={"api_key": api_key}, timeout=30)
     if resp.status_code != 200:
-        print(f"[ERROR] API 요청 실패 (HTTP {resp.status_code}): {resp.text[:200]}")
+        print(f"[ERROR] API 요청 실패 (HTTP {resp.status_code}): {resp.text[:300]}")
         sys.exit(1)
-
     data = resp.json()
     if "export" not in data or "link" not in data["export"]:
         print(f"[ERROR] 응답에 download link 없음: {data}")
         sys.exit(1)
+    return data["export"]["link"]
 
-    download_url = data["export"]["link"]
-    print(f"  다운로드 URL: {download_url[:80]}...")
 
-    # Step 2: zip 다운로드
+def download_from_roboflow(api_key: str, workspace: str, project: str, version: int):
+    """Roboflow REST API를 직접 호출하여 데이터셋을 다운로드합니다.
+
+    Roboflow는 export를 lazy하게 생성하므로, 첫 요청 시 GCS에 파일이
+    아직 없을 수 있습니다. 재시도마다 fresh signed URL을 재요청합니다.
+    """
+    MAX_RETRIES = 6
+    RETRY_DELAYS = [5, 10, 15, 20, 30, 30]  # 초 단위
+
+    api_url = f"https://api.roboflow.com/{workspace}/{project}/{version}/yolov8"
+    print(f"  API 요청: {api_url}")
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "dataset.zip"
-        print("  zip 다운로드 중...")
-        with requests.get(download_url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            with open(zip_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        pct = downloaded / total * 100
-                        print(f"\r  {pct:5.1f}% ({downloaded//1024}KB / {total//1024}KB)", end="", flush=True)
-        print(f"\n  다운로드 완료: {zip_path.stat().st_size // 1024} KB")
 
-        # Step 3: zip 검증 및 압축 해제
+        for attempt in range(MAX_RETRIES):
+            # 매 시도마다 fresh signed URL 재요청 (만료/미생성 대응)
+            download_url = _get_fresh_download_url(api_key, workspace, project, version)
+            print(f"  [시도 {attempt+1}/{MAX_RETRIES}] 다운로드 URL: {download_url[:70]}...")
+
+            try:
+                with requests.get(download_url, stream=True, timeout=180) as r:
+                    if r.status_code == 404:
+                        wait = RETRY_DELAYS[attempt]
+                        print(f"  [404] export 생성 중... {wait}초 후 재시도")
+                        time.sleep(wait)
+                        continue
+                    r.raise_for_status()
+
+                    total = int(r.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(zip_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = downloaded / total * 100
+                                print(f"\r  {pct:5.1f}%  ({downloaded//1024} KB / {total//1024} KB)",
+                                      end="", flush=True)
+                print(f"\n  다운로드 완료: {zip_path.stat().st_size // 1024} KB")
+                break  # 성공
+
+            except requests.HTTPError as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = RETRY_DELAYS[attempt]
+                    print(f"\n  [오류] {e} — {wait}초 후 재시도...")
+                    time.sleep(wait)
+                else:
+                    print(f"\n[ERROR] 다운로드 최종 실패: {e}")
+                    sys.exit(1)
+        else:
+            print("[ERROR] 최대 재시도 횟수 초과. 잠시 후 다시 실행하거나 수동으로 데이터를 준비하세요.")
+            sys.exit(1)
+
+        # zip 검증 및 압축 해제
         if not zipfile.is_zipfile(zip_path):
             print("[ERROR] 다운로드된 파일이 유효한 zip 파일이 아닙니다.")
             print("        API 키 권한 또는 프로젝트/버전 번호를 확인하세요.")
@@ -83,7 +116,7 @@ def download_from_roboflow(api_key: str, workspace: str, project: str, version: 
             zf.extractall(extract_dir)
         print(f"  압축 해제 완료: {extract_dir}")
 
-        # Step 4: data/ 폴더에 복사
+        # data/ 폴더에 복사
         dest_root = Path("data")
         for split in ["train", "valid", "test"]:
             # 압축 해제 후 구조가 다를 수 있으므로 재귀 탐색
